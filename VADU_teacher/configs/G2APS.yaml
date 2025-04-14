@@ -1,0 +1,24 @@
+OUTPUT_DIR: "/home/patrick/wqf/SeqNet-master/logs/teacher_seqnet/"    #"/home/patrick/wqf/SeqNet-master/logs/logs_e2e_v1_trainmethod2_roialign16_8_frozenbn_resnet34_LR_0.006"
+INPUT:
+  DATASET: "CUHK-SYSU"
+  DATA_ROOT: "/home/patrick/wqf/Data/G2APS/G2APS_in_market1501_style/Market-1501-v15.09.15/"
+  MIN_SIZE: [600, 800, 900]   #原版Seqnet不需要多尺度
+  #MIN_SIZE: 900                #seqnet_v21也跑一个不需要多尺度的方案
+  MAX_SIZE: 1500
+  BATCH_SIZE_TRAIN: 3    #Batchsize 3_3
+  NUM_WORKERS_TRAIN: 3
+SOLVER:
+  MAX_EPOCHS: 300
+  BASE_LR: 0.0036
+  LR_DECAY_MILESTONES: [80, 150]   #学习率下降点
+MODEL:
+  #ROI_HEAD:
+  #  BATCH_SIZE_TRAIN: 256  #从128改到256尝试一下
+  LOSS:
+    LUT_SIZE: 5532       #查找表的大小
+    #LUT_SIZE: 2078
+    CQ_SIZE: 5000        #Candidate Queue候选队列的大小
+    #CQ_SIZE: 2000
+
+eval_interval: 10
+duke_path: "/home/patrick/wqf/Data/G2APS/G2APS_in_market1501_style/Market-1501-v15.09.15/"
