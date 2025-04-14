@@ -1,0 +1,3 @@
+#from .build import build_test_loader, build_train_loader
+from .build_single_view import build_test_loader_aerial, build_train_loader_aerial, build_test_loader_ground, build_train_loader_ground, build_dataset
+#通过在__init__.py文件中导入这些函数，可以在其他地方通过datasets.build_test_loader和datasets.build_train_loader来使用它们，而不需要直接导入build模块。

@@ -1,0 +1,373 @@
+import argparse
+import datetime
+import os
+import os.path as osp
+import time
+
+import torch
+import torch.utils.data
+
+from datasets.build_mix_view import build_train_loader, build_test_loader    #加载混合数据集
+from datasets import build_train_loader_aerial, build_train_loader_ground, build_test_loader_aerial, build_test_loader_ground
+from defaults import get_default_cfg
+from engine import train_one_epoch_mix_dataset, evaluate_performance_aerial, evaluate_performance_ground, evaluate_performance_Re_ID_seqnet
+
+from models.seqnet_model_decomp_mix_dataset_input import SeqNet
+
+from utils.utils import mkdir, resume_from_ckpt, save_on_master, set_random_seed
+
+'''
+def main(args):
+    cfg = get_default_cfg()
+    if args.cfg_file:
+        cfg.merge_from_file(args.cfg_file)
+    cfg.merge_from_list(args.opts)
+    cfg.freeze()
+
+    device = torch.device(cfg.DEVICE)
+    if cfg.SEED >= 0:
+        set_random_seed(cfg.SEED)
+
+    print("Creating model")
+    model = SeqNet(cfg)
+    model.to(device)
+
+    print("Loading data")
+    train_loader = build_train_loader(cfg)
+    gallery_loader, query_loader = build_test_loader(cfg)
+
+    if args.eval:
+        assert args.ckpt, "--ckpt must be specified when --eval enabled"
+        resume_from_ckpt(args.ckpt, model)
+        evaluate_performance(
+            model,
+            gallery_loader,
+            query_loader,
+            device,
+            use_gt=cfg.EVAL_USE_GT,
+            use_cache=cfg.EVAL_USE_CACHE,
+            use_cbgm=cfg.EVAL_USE_CBGM,
+        )
+        exit(0)
+
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.SGD(
+        params,
+        lr=cfg.SOLVER.BASE_LR,
+        momentum=cfg.SOLVER.SGD_MOMENTUM,
+        weight_decay=cfg.SOLVER.WEIGHT_DECAY,
+    )
+
+    lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
+        optimizer, milestones=cfg.SOLVER.LR_DECAY_MILESTONES, gamma=0.1
+    )
+
+    start_epoch = 0
+    if args.resume:
+        assert args.ckpt, "--ckpt must be specified when --resume enabled"
+        start_epoch = resume_from_ckpt(args.ckpt, model, optimizer, lr_scheduler) + 1
+
+    print("Creating output folder")
+    output_dir = cfg.OUTPUT_DIR
+    mkdir(output_dir)
+    path = osp.join(output_dir, "config.yaml")
+    with open(path, "w") as f:
+        f.write(cfg.dump())
+    print(f"Full config is saved to {path}")
+    tfboard = None
+    if cfg.TF_BOARD:
+        from torch.utils.tensorboard import SummaryWriter
+
+        tf_log_path = osp.join(output_dir, "tf_log")
+        mkdir(tf_log_path)
+        tfboard = SummaryWriter(log_dir=tf_log_path)
+        print(f"TensorBoard files are saved to {tf_log_path}")
+
+    print("Start training")
+    start_time = time.time()
+    for epoch in range(start_epoch, cfg.SOLVER.MAX_EPOCHS):
+        train_one_epoch(cfg, model, optimizer, train_loader, device, epoch, tfboard)
+        lr_scheduler.step()
+
+        if (epoch + 1) % cfg.EVAL_PERIOD == 0 or epoch == cfg.SOLVER.MAX_EPOCHS - 1:
+            evaluate_performance(
+                model,
+                gallery_loader,
+                query_loader,
+                device,
+                use_gt=cfg.EVAL_USE_GT,
+                use_cache=cfg.EVAL_USE_CACHE,
+                use_cbgm=cfg.EVAL_USE_CBGM,
+            )
+
+        if (epoch + 1) % cfg.CKPT_PERIOD == 0 or epoch == cfg.SOLVER.MAX_EPOCHS - 1:
+            save_on_master(
+                {
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "lr_scheduler": lr_scheduler.state_dict(),
+                    "epoch": epoch,
+                },
+                osp.join(output_dir, f"epoch_{epoch}.pth"),
+            )
+
+    if tfboard:
+        tfboard.close()
+    total_time = time.time() - start_time
+    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    print(f"Total training time {total_time_str}")
+'''
+
+def main(args):
+    cfg = get_default_cfg()
+    if args.cfg_file:
+        cfg.merge_from_file(args.cfg_file)
+    cfg.merge_from_list(args.opts)
+    cfg.freeze()
+
+    device = torch.device(cfg.DEVICE)
+    if cfg.SEED >= 0:
+        set_random_seed(cfg.SEED)
+
+    print("Creating model")
+    model = SeqNet(cfg)
+    model.to(device)
+
+    print("Loading data")
+    # load地面数据集和空中数据集
+    #单一数据集的gallery_loader, query_loader
+    gallery_loader_aerial, query_loader_aerial = build_test_loader_aerial(cfg)
+    gallery_loader_ground, query_loader_ground = build_test_loader_ground(cfg)
+    # load混合数据集用于测试Re-ID性能
+    train_loader = build_train_loader(cfg)
+    gallery_loader, query_loader = build_test_loader(cfg)
+    
+    if args.eval:
+        assert args.ckpt, "--ckpt must be specified when --eval enabled"
+        #循环评估所有epoch的模型性能
+        for epoch_num in range(9,15):
+            # 动态生成模型路径
+            ckpt_path = osp.join(args.ckpt, f"epoch_{epoch_num}.pth")
+        
+            #加载当前的 epoch 模型
+            resume_from_ckpt(ckpt_path, model)
+
+            evaluate_performance_aerial(       
+                    model,
+                    device,
+                    gallery_loader_aerial,
+                    query_loader_aerial,
+                    use_gt=cfg.EVAL_USE_GT,
+                    use_cache=cfg.EVAL_USE_CACHE,
+                    use_cbgm=cfg.EVAL_USE_CBGM,
+                )
+            
+            evaluate_performance_ground(      
+                    model,
+                    device,
+                    gallery_loader_ground,
+                    query_loader_ground,
+                    use_gt=cfg.EVAL_USE_GT,
+                    use_cache=cfg.EVAL_USE_CACHE,
+                    use_cbgm=cfg.EVAL_USE_CBGM,
+                )
+
+            evaluate_performance_Re_ID_seqnet(      
+                model,
+                gallery_loader,
+                query_loader,
+                device,
+                use_gt=cfg.EVAL_USE_GT,
+                #use_gt=True,
+                use_cache=cfg.EVAL_USE_CACHE,
+                use_cbgm=cfg.EVAL_USE_CBGM,
+            )
+        exit(0)
+
+    '''
+    if args.eval:
+        assert args.ckpt, "--ckpt must be specified when --eval enabled"
+        
+        # 初始化最佳性能指标
+        best_performance = -1.0
+        best_epoch = -1
+        best_model_path = None
+
+        # 获取所有保存的模型 checkpoint
+        ckpt_files = sorted([f for f in os.listdir(args.ckpt) if f.startswith("epoch_") and f.endswith(".pth")])
+        
+        for ckpt_file in ckpt_files:
+            ckpt_path = osp.join(args.ckpt, ckpt_file)
+            print(f"Evaluating model from {ckpt_path}")
+            
+            # 加载模型
+            resume_from_ckpt(ckpt_path, model)
+            
+            # 评估模型在 aerial 数据集上的性能
+            aerial_performance = evaluate_performance_aerial(       
+                model,
+                device,
+                gallery_loader_aerial,
+                query_loader_aerial,
+                use_gt=cfg.EVAL_USE_GT,
+                use_cache=cfg.EVAL_USE_CACHE,
+                use_cbgm=cfg.EVAL_USE_CBGM,
+            )
+            
+            # 评估模型在 ground 数据集上的性能
+            ground_performance = evaluate_performance_ground(      
+                model,
+                device,
+                gallery_loader_ground,
+                query_loader_ground,
+                use_gt=cfg.EVAL_USE_GT,
+                use_cache=cfg.EVAL_USE_CACHE,
+                use_cbgm=cfg.EVAL_USE_CBGM,
+            )
+            
+            # 综合性能（可以根据需要调整加权方式）
+            total_performance = (aerial_performance + ground_performance) / 2
+            
+            # 更新最佳性能模型
+            if total_performance > best_performance:
+                best_performance = total_performance
+                best_epoch = int(ckpt_file.split("_")[1].split(".")[0])
+                best_model_path = ckpt_path
+
+        print(f"Best model found at epoch {best_epoch} with performance {best_performance}")
+        print(f"Best model path: {best_model_path}")
+        exit(0)
+    '''
+    '''
+    # optimizer参数分组
+    bk_params = []
+    head_params = []
+    for n,p in model.named_parameters():
+        if n.startswith("backbone"):
+            bk_params.append(p)
+        else:
+            head_params.append(p)
+    #params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.SGD(
+        [
+            {'params': head_params, 'lr': cfg.SOLVER.BASE_LR},
+            {'params': bk_params, 'lr': cfg.SOLVER.BASE_LR*0.5}
+        ],
+        lr=cfg.SOLVER.BASE_LR,
+        momentum=cfg.SOLVER.SGD_MOMENTUM,
+        weight_decay=cfg.SOLVER.WEIGHT_DECAY,
+    )
+    '''
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.SGD(
+        params,
+        lr=cfg.SOLVER.BASE_LR,
+        momentum=cfg.SOLVER.SGD_MOMENTUM,
+        weight_decay=cfg.SOLVER.WEIGHT_DECAY,
+    )
+
+    lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
+        optimizer, milestones=cfg.SOLVER.LR_DECAY_MILESTONES, gamma=0.1
+    )
+
+    start_epoch = 0
+    if args.resume:
+        assert args.ckpt, "--ckpt must be specified when --resume enabled"
+        start_epoch = resume_from_ckpt(args.ckpt, model, optimizer, lr_scheduler) + 1
+
+    print("Creating output folder")
+    output_dir = cfg.OUTPUT_DIR
+    mkdir(output_dir)
+    path = osp.join(output_dir, "config.yaml")
+    with open(path, "w") as f:
+        f.write(cfg.dump())
+    print(f"Full config is saved to {path}")
+    tfboard = None
+    if cfg.TF_BOARD:
+        from torch.utils.tensorboard import SummaryWriter
+
+        tf_log_path = osp.join(output_dir, "tf_log")
+        mkdir(tf_log_path)
+        tfboard = SummaryWriter(log_dir=tf_log_path)
+        print(f"TensorBoard files are saved to {tf_log_path}")
+
+    #初始化最佳性能指标
+    best_performance = -1.0
+    best_epoch = -1
+    print("Start training")
+    start_time = time.time()
+    for epoch in range(start_epoch, cfg.SOLVER.MAX_EPOCHS):
+        #进一步修改train_one_epoch方案
+        train_one_epoch_mix_dataset(cfg, model, optimizer, train_loader, device, epoch, tfboard)
+        lr_scheduler.step()
+
+        if (epoch + 1) % cfg.CKPT_PERIOD == 0 or epoch == cfg.SOLVER.MAX_EPOCHS - 1:
+            save_on_master(
+                {
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "lr_scheduler": lr_scheduler.state_dict(),
+                    "epoch": epoch,
+                },
+                osp.join(output_dir, f"epoch_{epoch}.pth"),
+            )
+
+        if (epoch + 1) % cfg.CKPT_PERIOD == 0 or epoch == cfg.SOLVER.MAX_EPOCHS - 1:
+            '''
+            evaluate_performance_aerial(       
+                model,
+                device,
+                gallery_loader_aerial,
+                query_loader_aerial,
+                use_gt=cfg.EVAL_USE_GT,
+                use_cache=cfg.EVAL_USE_CACHE,
+                use_cbgm=cfg.EVAL_USE_CBGM,
+            )
+
+            evaluate_performance_ground(      
+                    model,
+                    device,
+                    gallery_loader_ground,
+                    query_loader_ground,
+                    use_gt=cfg.EVAL_USE_GT,
+                    use_cache=cfg.EVAL_USE_CACHE,
+                    use_cbgm=cfg.EVAL_USE_CBGM,
+            )
+            '''
+            
+            #先只评估混合检测和Re-ID
+            evaluate_performance_Re_ID_seqnet(      
+                model,
+                gallery_loader,
+                query_loader,
+                device,
+                use_gt=cfg.EVAL_USE_GT,
+                #use_gt=True,
+                use_cache=cfg.EVAL_USE_CACHE,
+                use_cbgm=cfg.EVAL_USE_CBGM,
+            )
+            
+
+        
+
+    if tfboard:
+        tfboard.close()
+    total_time = time.time() - start_time
+    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    print(f"Total training time {total_time_str}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train a person search network.")
+    parser.add_argument("--cfg", dest="cfg_file", help="Path to configuration file.")
+    parser.add_argument(
+        "--eval", action="store_true", help="Evaluate the performance of a given checkpoint."
+    )
+    parser.add_argument(
+        "--resume", action="store_true", help="Resume from the specified checkpoint."
+    )
+    parser.add_argument("--ckpt", help="Path to checkpoint to resume or evaluate.")
+    parser.add_argument(
+        "opts", nargs=argparse.REMAINDER, help="Modify config options using the command-line"
+    )
+    args = parser.parse_args()
+    main(args)

@@ -1,0 +1,927 @@
+from copy import deepcopy
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.transforms as T
+from torch.nn import init
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection.roi_heads import RoIHeads
+from torchvision.models.detection.rpn import AnchorGenerator, RegionProposalNetwork, RPNHead
+from torchvision.models.detection.transform import GeneralizedRCNNTransform
+from torchvision.ops import MultiScaleRoIAlign
+from torchvision.ops import boxes as box_ops
+
+from models.oim import OIMLoss, MemContrast
+from models.resnet import build_resnet
+from collections import OrderedDict
+from .image_list import ImageList
+import time
+import math
+import torch
+import torch.nn as nn
+from typing import List, Dict, Optional, Tuple, Any
+from torch import Tensor
+from torchvision.models.detection.image_list import ImageList
+
+
+class SeqNet(nn.Module):
+    def __init__(self, cfg):
+        super(SeqNet, self).__init__()
+
+        backbone, box_head = build_resnet(name="resnet34", pretrained=True)
+        backbone_ground = backbone
+        backbone_aerial = deepcopy(backbone)
+        anchor_generator = AnchorGenerator(
+            sizes=((32, 64, 128, 256, 512),), aspect_ratios=((0.5, 1.0, 2.0),)
+        )
+        head = RPNHead(
+            in_channels=backbone.out_channels,
+            num_anchors=anchor_generator.num_anchors_per_location()[0],
+        )
+        pre_nms_top_n = dict(
+            training=cfg.MODEL.RPN.PRE_NMS_TOPN_TRAIN, testing=cfg.MODEL.RPN.PRE_NMS_TOPN_TEST
+        )
+        post_nms_top_n = dict(
+            training=cfg.MODEL.RPN.POST_NMS_TOPN_TRAIN, testing=cfg.MODEL.RPN.POST_NMS_TOPN_TEST
+        )
+        rpn_air = RegionProposalNetwork(
+            anchor_generator=anchor_generator,
+            head=head,
+            fg_iou_thresh=cfg.MODEL.RPN.POS_THRESH_TRAIN,
+            bg_iou_thresh=cfg.MODEL.RPN.NEG_THRESH_TRAIN,
+            batch_size_per_image=cfg.MODEL.RPN.BATCH_SIZE_TRAIN,
+            positive_fraction=cfg.MODEL.RPN.POS_FRAC_TRAIN,
+            pre_nms_top_n=pre_nms_top_n,
+            post_nms_top_n=post_nms_top_n,
+            nms_thresh=cfg.MODEL.RPN.NMS_THRESH,
+        )
+        rpn_ground = deepcopy(rpn_air)
+
+        faster_rcnn_predictor = FastRCNNPredictor(512, 2)
+        reid_head = deepcopy(box_head)
+        box_roi_pool = MultiScaleRoIAlign(
+            featmap_names=["feat_res4"], output_size=(16, 8), sampling_ratio=2
+        )
+        box_predictor = BBoxRegressor(512, num_classes=2, bn_neck=cfg.MODEL.ROI_HEAD.BN_NECK)
+        roi_heads = SeqRoIHeads(
+            num_pids=cfg.MODEL.LOSS.LUT_SIZE,
+            num_cq_size=cfg.MODEL.LOSS.CQ_SIZE,
+            oim_momentum=cfg.MODEL.LOSS.OIM_MOMENTUM,
+            oim_scalar=cfg.MODEL.LOSS.OIM_SCALAR,
+            faster_rcnn_predictor=faster_rcnn_predictor,
+            reid_head=reid_head,
+            box_roi_pool=box_roi_pool,
+            box_head=box_head,
+            box_predictor=box_predictor,
+            fg_iou_thresh=cfg.MODEL.ROI_HEAD.POS_THRESH_TRAIN,
+            bg_iou_thresh=cfg.MODEL.ROI_HEAD.NEG_THRESH_TRAIN,
+            batch_size_per_image=cfg.MODEL.ROI_HEAD.BATCH_SIZE_TRAIN,
+            positive_fraction=cfg.MODEL.ROI_HEAD.POS_FRAC_TRAIN,
+            bbox_reg_weights=None,
+            score_thresh=cfg.MODEL.ROI_HEAD.SCORE_THRESH_TEST,
+            nms_thresh=cfg.MODEL.ROI_HEAD.NMS_THRESH_TEST,
+            detections_per_img=cfg.MODEL.ROI_HEAD.DETECTIONS_PER_IMAGE_TEST,
+        )
+        # 图像预处理
+        transform = GeneralizedRCNNTransform(
+            min_size=900,
+            max_size=1500,
+            image_mean=[0.485, 0.456, 0.406],
+            image_std=[0.229, 0.224, 0.225],
+        )
+
+        self.backbone_aerial = backbone_aerial
+        self.backbone_ground = backbone_ground
+        self.rpn_air = rpn_air
+        self.rpn_ground = rpn_ground
+        self.roi_heads = roi_heads
+        self.transform = transform
+
+        # loss weights
+        self.lw_rpn_reg = cfg.SOLVER.LW_RPN_REG
+        self.lw_rpn_cls = cfg.SOLVER.LW_RPN_CLS
+        self.lw_proposal_reg = cfg.SOLVER.LW_PROPOSAL_REG
+        self.lw_proposal_cls = cfg.SOLVER.LW_PROPOSAL_CLS
+        self.lw_box_reg = cfg.SOLVER.LW_BOX_REG
+        self.lw_box_cls = cfg.SOLVER.LW_BOX_CLS
+        self.lw_box_reid = cfg.SOLVER.LW_BOX_REID
+    
+    def inference(self, images_aerial=None, images_ground=None, targets_aerial=None, targets_ground=None, query_img_as_gallery=False):
+        """
+        images: 同时包括空中和地面视角的测试图像
+        query_img_as_gallery: Set to True to detect all people in the query image.
+            Meanwhile, the gt box should be the first of the detected boxes.
+            This option serves CBGM.
+        Returns:
+            detections: 检测结果
+            timing_info: 字典，包含检测和特征提取的耗时（毫秒）和 FPS
+        """
+        original_image_sizes = []
+        images = []
+        targets = []
+        num_images_aerial = 0
+        num_images_ground = 0
+
+        # 初始化计时变量
+        timing_info = {
+            "postprocess_time": 0.0, # 后处理时间
+            "backbone_time": 0.0,   # backbone 时间
+            "rpn_time": 0.0,        # RPN 时间
+            "total_time": 0.0,      # 总时间
+            "fps": 0.0              # FPS
+        }
+
+        # 处理空中视角的图像和目标
+        if images_aerial is not None:
+            original_image_sizes.extend([img.shape[-2:] for img in images_aerial])
+            images.extend(images_aerial)
+            num_images_aerial = len(images_aerial)
+            if targets_aerial is not None:
+                targets.extend(targets_aerial)
+            else:
+                targets = None
+
+            # 计时：图像预处理，不需要计时
+            #start_time = time.time()
+            images, targets = self.transform(images, targets)
+            #timing_info["transform_time"] = (time.time() - start_time) * 1000
+
+            # 计时：backbone
+            start_time = time.time()
+            features = self.backbone_aerial(images.tensors)
+            timing_info["backbone_time"] = (time.time() - start_time) * 1000
+
+            if query_img_as_gallery:
+                assert targets is not None
+            
+            if targets is not None and not query_img_as_gallery:
+                # query 空中视角
+                boxes = [t["boxes"] for t in targets]
+                box_features = self.roi_heads.box_roi_pool(features, boxes, images.image_sizes)
+                box_features = self.roi_heads.reid_head(box_features)
+                embeddings, _ = self.roi_heads.embedding_head(box_features)
+                return embeddings.split(1, 0)
+            else:
+                # gallery 空中视角
+                features_aerial = OrderedDict([("feat_res4", features["feat_res4"])])
+
+                # 计时：RPN
+                start_time = time.time()
+                proposals_aerial, _ = self.rpn_air(images, features_aerial, targets)
+                timing_info["rpn_time"] = (time.time() - start_time) * 1000
+
+                detections, _, roi_timing = self.roi_heads(
+                    features, images.image_sizes, features_aerial, None, proposals_aerial, None, targets_aerial, None, query_img_as_gallery
+                )
+
+                # Merge ROI timing into timing_info
+                for key, value in roi_timing.items():
+                    if key in timing_info:
+                        timing_info[key] += value
+                    else:
+                        timing_info[key] = value
+
+                start_time = time.time()
+                detections = self.transform.postprocess(
+                    detections, images.image_sizes, original_image_sizes
+                )
+                timing_info["postprocess_time"] = (time.time() - start_time) * 1000
+
+                timing_info["total_time"] = ( 
+                    timing_info["backbone_time"] + 
+                    timing_info["rpn_time"] + 
+                    timing_info["postprocess_time"] +
+                    timing_info["baseline_head_time"] +
+                    timing_info["faster_rcnn_time_air"] +
+                    timing_info["postprocess_proposals_time_air"] +
+                    timing_info["postprocess_boxes_time"]
+                )
+                timing_info["fps"] = 1000 / timing_info["total_time"] if timing_info["total_time"] > 0 else 0
+                return detections, timing_info
+
+        # 处理地面视角的图像和目标
+        if images_ground is not None:
+            original_image_sizes.extend([img.shape[-2:] for img in images_ground])
+            images.extend(images_ground)
+            num_images_ground = len(images_ground)
+            if targets_ground is not None:
+                targets.extend(targets_ground)
+            else:
+                targets = None
+
+            # 计时：图像预处理
+            #start_time = time.time()
+            images, targets = self.transform(images, targets)
+            #timing_info["transform_time"] = (time.time() - start_time) * 1000
+
+            # 计时：backbone
+            start_time = time.time()
+            features = self.backbone_ground(images.tensors)
+            timing_info["backbone_time"] = (time.time() - start_time) * 1000
+
+            if query_img_as_gallery:
+                assert targets is not None
+
+            if targets is not None and not query_img_as_gallery:
+                # query 地面视角
+                boxes = [t["boxes"] for t in targets]
+                box_features = self.roi_heads.box_roi_pool(features, boxes, images.image_sizes)
+                box_features = self.roi_heads.reid_head(box_features)
+                embeddings, _ = self.roi_heads.embedding_head(box_features)
+                return embeddings.split(1, 0)
+            else:
+                # gallery 地面视角
+                features_ground = OrderedDict([("feat_res4", features["feat_res4"])])
+
+                # 计时：RPN
+                start_time = time.time()
+                proposals_ground, _ = self.rpn_ground(images, features_ground, targets)
+                timing_info["rpn_time"] = (time.time() - start_time) * 1000
+
+                detections, _ , roi_timing = self.roi_heads(
+                    features, images.image_sizes, None, features_ground, None, proposals_ground, None, targets_ground, query_img_as_gallery
+                )
+
+                # Merge ROI timing into timing_info
+                for key, value in roi_timing.items():
+                    if key in timing_info:
+                        timing_info[key] += value
+                    else:
+                        timing_info[key] = value
+
+                time_start = time.time()
+                detections = self.transform.postprocess(
+                    detections, images.image_sizes, original_image_sizes
+                )
+                timing_info["postprocess_time"] = (time.time() - time_start) * 1000
+
+                timing_info["total_time"] = ( 
+                    timing_info["backbone_time"] + 
+                    timing_info["rpn_time"] + 
+                    timing_info["postprocess_time"] +
+                    timing_info["baseline_head_time"] +
+                    timing_info["faster_rcnn_time_ground"] +
+                    timing_info["postprocess_proposals_time_ground"] +
+                    timing_info["postprocess_boxes_time"]
+                )
+                timing_info["fps"] = 1000 / timing_info["total_time"] if timing_info["total_time"] > 0 else 0
+                return detections, timing_info
+
+    def forward(self, images_aerial=None, images_ground=None, targets_aerial=None, targets_ground=None, query_img_as_gallery=False):
+        if not self.training:
+            if images_aerial is not None and images_ground is None:
+                return self.inference(images_aerial, None, targets_aerial, None, query_img_as_gallery)
+            elif images_aerial is None and images_ground is not None:
+                return self.inference(None, images_ground, None, targets_ground, query_img_as_gallery)
+            else:
+                return self.inference(images_aerial, images_ground, targets_aerial, targets_ground, query_img_as_gallery)
+
+        # 训练部分的代码保持不变
+        batch_size_air = len(images_aerial)
+        batch_size_ground = len(images_ground)
+        images = images_aerial + images_ground
+        targets = targets_aerial + targets_ground if targets_aerial is not None and targets_ground is not None else None
+        images, targets = self.transform(images, targets)
+        images_aerial_tensors = images.tensors[:batch_size_air]
+        images_ground_tensors = images.tensors[batch_size_air:]
+        images_aerial = ImageList(images_aerial_tensors, images.image_sizes[:batch_size_air])
+        images_ground = ImageList(images_ground_tensors, images.image_sizes[batch_size_air:])
+        if targets is not None:
+            targets_aerial = targets[:batch_size_air]
+            targets_ground = targets[batch_size_air:]
+        features_aerial = self.backbone_aerial(images_aerial.tensors)
+        features_ground = self.backbone_ground(images_ground.tensors)
+        features = torch.cat((features_aerial["feat_res4"], features_ground["feat_res4"]), dim=0)
+        features = OrderedDict([("feat_res4", features)])
+        proposals_aerial, proposal_losses_aerial = self.rpn_air(images_aerial, features_aerial, targets_aerial)
+        proposals_ground, proposal_losses_ground = self.rpn_ground(images_ground, features_ground, targets_ground)
+        image_sizes = images_aerial.image_sizes + images_ground.image_sizes
+        _, detector_losses = self.roi_heads(features, image_sizes, features_aerial, features_ground, proposals_aerial, proposals_ground, targets_aerial, targets_ground)
+
+        proposal_losses_aerial["loss_rpn_reg"] = proposal_losses_aerial.pop("loss_rpn_box_reg")
+        proposal_losses_aerial["loss_rpn_cls"] = proposal_losses_aerial.pop("loss_objectness")
+        proposal_losses_ground["loss_rpn_reg"] = proposal_losses_ground.pop("loss_rpn_box_reg")
+        proposal_losses_ground["loss_rpn_cls"] = proposal_losses_ground.pop("loss_objectness")
+        combined_rpn_losses = {}
+        for key in proposal_losses_aerial.keys():
+            combined_rpn_losses[key] = 0.5 * proposal_losses_aerial[key] + 0.5 * proposal_losses_ground[key]
+        losses = {}
+        losses.update(detector_losses)
+        losses.update(combined_rpn_losses)
+        losses["loss_rpn_reg"] *= self.lw_rpn_reg
+        losses["loss_rpn_cls"] *= self.lw_rpn_cls
+        losses["loss_proposal_reg"] *= self.lw_proposal_reg
+        losses["loss_proposal_cls"] *= self.lw_proposal_cls
+        losses["loss_box_reg"] *= self.lw_box_reg
+        losses["loss_box_cls"] *= self.lw_box_cls
+        losses["loss_box_reid"] *= 0.5
+        losses["loss_box_reid_air"] *= 0.25
+        losses["loss_box_reid_ground"] *= 0.25
+        losses["loss_contrast_a2g"] *= 0.35
+        losses["loss_contrast_g2a"] *= 0.35
+        losses["loss_box_reid"] *= self.lw_box_reid
+        losses["loss_box_reid_air"] *= self.lw_box_reid
+        losses["loss_box_reid_ground"] *= self.lw_box_reid
+        losses["loss_contrast_a2g"] *= self.lw_box_reid
+        losses["loss_contrast_g2a"] *= self.lw_box_reid
+        return losses
+
+
+class SeqRoIHeads(RoIHeads):
+    def __init__(
+        self,
+        num_pids,
+        num_cq_size,
+        oim_momentum,
+        oim_scalar,
+        faster_rcnn_predictor,
+        reid_head,
+        *args,
+        **kwargs
+    ):
+        super(SeqRoIHeads, self).__init__(*args, **kwargs)
+        # Re-ID head 共享
+        self.embedding_head = NormAwareEmbedding()
+        self.reid_loss = OIMLoss(256, num_pids, num_cq_size, oim_momentum, oim_scalar)
+        self.reid_loss_air = OIMLoss(256, num_pids, num_cq_size, oim_momentum, oim_scalar)
+        self.reid_loss_ground = OIMLoss(256, num_pids, num_cq_size, oim_momentum, oim_scalar)
+        # 对比loss
+        self.contrast_g2a = MemContrast(256, oim_scalar)
+        self.contrast_a2g = MemContrast(256, oim_scalar)
+        
+        # 使用 deepcopy 创建独立的 faster_rcnn_predictor head，确保参数不共享
+        self.faster_rcnn_predictor = faster_rcnn_predictor
+        self.faster_rcnn_predictor_air = deepcopy(self.faster_rcnn_predictor)
+        self.faster_rcnn_predictor_ground = deepcopy(self.faster_rcnn_predictor)
+        
+        # 使用 deepcopy 创建独立的 detection head，确保参数不共享
+        self.box_head_air = deepcopy(self.box_head)
+        self.box_head_ground = deepcopy(self.box_head)
+        
+        self.reid_head = reid_head
+        # rename the method inherited from parent class
+        self.postprocess_proposals = self.postprocess_detections
+
+    def forward(self, features, image_shapes, features_air=None, features_ground=None, proposals_air=None, proposals_ground=None, targets_aerial=None, targets_ground=None, query_img_as_gallery=False):
+        """
+        Arguments:
+            features_air (List[Tensor]): Features from the air view backbone.
+            features_ground (List[Tensor]): Features from the ground view backbone.
+            proposals_air (List[Tensor[N, 4]]): Proposals from the air view RPN.
+            proposals_ground (List[Tensor[N, 4]]): Proposals from the ground view RPN.
+            image_shapes (List[Tuple[H, W]]): Shapes of the input images.
+            targets_aerial (List[Dict]): Ground truth aerial targets.
+            targets_ground (List[Dict]): Ground truth ground targets.
+        """
+        if self.training:
+            # Select training samples for air and ground views
+            if proposals_air is not None:
+                proposals_air, _, proposal_pid_labels_air, proposal_reg_targets_air = self.select_training_samples(
+                    proposals_air, targets_aerial
+                )
+            if proposals_ground is not None:
+                proposals_ground, _, proposal_pid_labels_ground, proposal_reg_targets_ground = self.select_training_samples(
+                    proposals_ground, targets_ground
+                )
+        
+        # Initialize timing dictionary
+        timing_info = {
+            "postprocess_proposals_time_air": 0.0,
+            "faster_rcnn_time_air": 0.0,
+            "postprocess_proposals_time_ground": 0.0,
+            "faster_rcnn_time_ground": 0.0,
+            "postprocess_boxes_time": 0.0,
+            "baseline_head_time": 0.0,
+        }
+
+        # ------------------- Faster R-CNN head for air view ------------------ #
+        if features_air is not None and proposals_air is not None:
+            time_start = time.time()
+            proposal_features_air = self.box_roi_pool(features_air, proposals_air, image_shapes)
+            proposal_features_air = self.box_head_air(proposal_features_air)
+            proposal_cls_scores_air, proposal_regs_air = self.faster_rcnn_predictor_air(
+                proposal_features_air["feat_res5"]
+            )
+            timing_info["faster_rcnn_time_air"] = (time.time() - time_start) * 1000
+        else:
+            proposal_cls_scores_air, proposal_regs_air = None, None
+
+        # ------------------- Faster R-CNN head for ground view ------------------ #
+        if features_ground is not None and proposals_ground is not None:
+            time_start = time.time()
+            proposal_features_ground = self.box_roi_pool(features_ground, proposals_ground, image_shapes)
+            proposal_features_ground = self.box_head_ground(proposal_features_ground)
+            proposal_cls_scores_ground, proposal_regs_ground = self.faster_rcnn_predictor_ground(
+                proposal_features_ground["feat_res5"]
+            )
+            timing_info["faster_rcnn_time_ground"] = (time.time() - time_start) * 1000
+        else:
+            proposal_cls_scores_ground, proposal_regs_ground = None, None
+
+        if self.training:
+            # Get boxes for air and ground views
+            if proposal_regs_air is not None and proposals_air is not None:
+                boxes_air = self.get_boxes(proposal_regs_air, proposals_air, image_shapes)
+                boxes_air = [boxes_per_image.detach() for boxes_per_image in boxes_air]
+                boxes_air, _, box_pid_labels_air, box_reg_targets_air = self.select_training_samples(boxes_air, targets_aerial)
+            else:
+                boxes_air, box_pid_labels_air, box_reg_targets_air = [], [], []
+
+            if proposal_regs_ground is not None and proposals_ground is not None:
+                boxes_ground = self.get_boxes(proposal_regs_ground, proposals_ground, image_shapes)
+                boxes_ground = [boxes_per_image.detach() for boxes_per_image in boxes_ground]
+                boxes_ground, _, box_pid_labels_ground, box_reg_targets_ground = self.select_training_samples(boxes_ground, targets_ground)
+            else:
+                boxes_ground, box_pid_labels_ground, box_reg_targets_ground = [], [], []
+        else:
+            # Postprocess proposals for air and ground views
+            if proposal_cls_scores_air is not None and proposal_regs_air is not None and proposals_air is not None:
+                time_start = time.time()
+                boxes_air, scores_air, _ = self.postprocess_proposals(
+                    proposal_cls_scores_air, proposal_regs_air, proposals_air, image_shapes
+                )
+                timing_info["postprocess_proposals_time_air"] = (time.time() - time_start) * 1000
+            else:
+                boxes_air, scores_air = [], None
+
+            if proposal_cls_scores_ground is not None and proposal_regs_ground is not None and proposals_ground is not None:
+                time_start
+                boxes_ground, scores_ground, _ = self.postprocess_proposals(
+                    proposal_cls_scores_ground, proposal_regs_ground, proposals_ground, image_shapes
+                )
+                timing_info["postprocess_proposals_time_ground"] = (time.time() - time_start) * 1000
+            else:
+                boxes_ground, scores_ground = [], None
+
+        # Combine boxes from air and ground views for Re-ID
+        combined_boxes = boxes_air + boxes_ground
+        
+        # --------------------- Re-ID head -------------------- #
+        if combined_boxes and combined_boxes[0].shape[0]>0:     #不同虚拟环境版本对图像的处理有一些不同
+            time_start = time.time()
+            box_features = self.box_roi_pool(features, combined_boxes, image_shapes)
+            box_features = self.reid_head(box_features)
+            box_regs = self.box_predictor(box_features["feat_res5"])
+            box_embeddings, box_cls_scores = self.embedding_head(box_features)
+            if box_cls_scores.dim() == 0:
+                box_cls_scores = box_cls_scores.unsqueeze(0)
+            timing_info["baseline_head_time"] = (time.time() - time_start) * 1000
+        else:
+            box_regs, box_embeddings, box_cls_scores = None, None, None
+
+
+        result, losses = [], {}
+        if self.training:
+            # Compute detection losses for air and ground views
+            if proposal_cls_scores_air is not None and proposal_regs_air is not None:
+                proposal_labels_air = [y.clamp(0, 1) for y in proposal_pid_labels_air]
+                box_labels_air = [y.clamp(0, 1) for y in box_pid_labels_air]
+                losses_air = detection_losses_1(
+                    proposal_cls_scores_air,
+                    proposal_regs_air,
+                    proposal_labels_air,
+                    proposal_reg_targets_air,
+                )
+            else:
+                losses_air = {}
+
+            if proposal_cls_scores_ground is not None and proposal_regs_ground is not None:
+                proposal_labels_ground = [y.clamp(0, 1) for y in proposal_pid_labels_ground]
+                box_labels_ground = [y.clamp(0, 1) for y in box_pid_labels_ground]
+                losses_ground = detection_losses_1(
+                    proposal_cls_scores_ground,
+                    proposal_regs_ground,
+                    proposal_labels_ground,
+                    proposal_reg_targets_ground,
+                )
+            else:
+                losses_ground = {}
+
+            # 对losses_air和losses_ground的对应元素乘以0.5后相加
+            combined_losses = {}
+            for key in set(losses_air.keys()).union(losses_ground.keys()):
+                combined_losses[key] = 0.5 * losses_air.get(key, 0) + 0.5 * losses_ground.get(key, 0)
+
+            # 合并 box_labels 和 box_reg_targets
+            box_labels = box_labels_air + box_labels_ground
+            box_reg_targets = box_reg_targets_air + box_reg_targets_ground
+
+            losses_baseline_detection = detection_losses_2(
+                box_cls_scores,
+                box_regs,
+                box_labels,
+                box_reg_targets,
+            )
+
+            # 合并 box_pid_labels, box_embedding(768, 256)
+            combined_pid_labels = box_pid_labels_air + box_pid_labels_ground
+            loss_box_reid = self.reid_loss(box_embeddings, combined_pid_labels)
+            
+            # 计算各视图的独立损失
+            total_air_samples = sum(len(labels) for labels in box_pid_labels_air)
+            total_ground_samples = sum(len(labels) for labels in box_pid_labels_ground)
+            
+            box_embeddings_air = box_embeddings[:total_air_samples]   #[384, 256]
+            box_embeddings_ground = box_embeddings[total_air_samples:total_air_samples + total_ground_samples]
+
+            loss_box_reid_air = self.reid_loss_air(box_embeddings_air, box_pid_labels_air)
+            aerial_oim_lut = self.reid_loss_air.lut
+            aerial_oim_cq = self.reid_loss_air.cq
+            loss_box_reid_ground = self.reid_loss_ground(box_embeddings_ground, box_pid_labels_ground)
+            ground_oim_lut = self.reid_loss_ground.lut
+            ground_oim_cq = self.reid_loss_ground.cq
+            # 计算对比loss
+            loss_contrast_g2a = self.contrast_g2a(box_embeddings_ground, box_pid_labels_ground, aerial_oim_lut, aerial_oim_cq)
+            loss_contrast_a2g = self.contrast_a2g(box_embeddings_air, box_pid_labels_air, ground_oim_lut, ground_oim_cq)
+            # 不同loss权重组合成re-id loss
+            losses_baseline_detection.update(loss_contrast_a2g=loss_contrast_a2g)
+            losses_baseline_detection.update(loss_contrast_g2a=loss_contrast_g2a)
+            losses_baseline_detection.update(loss_box_reid_air=loss_box_reid_air)
+            losses_baseline_detection.update(loss_box_reid_ground=loss_box_reid_ground)
+            losses_baseline_detection.update(loss_box_reid=loss_box_reid)
+            #loss_box_reid = 0.5 * loss_box_reid + 0.25 * loss_box_reid_air + 0.25 * loss_box_reid_ground + 0.25 * loss_contrast_g2a + 0.25 * loss_contrast_a2g
+            #loss_box_reid = (1/3) * loss_box_reid + (1/3) * loss_box_reid_air + (1/3) * loss_box_reid_ground
+            #losses_baseline_detection.update(loss_box_reid=loss_box_reid)
+
+            # 合并combined_loss和losses_baseline_detection
+            losses = {**combined_losses, **losses_baseline_detection}
+
+        else:
+            if box_regs is None:
+                result.append(
+                    dict(
+                        boxes=torch.zeros((0,4), dtype=torch.int, device=features["feat_res4"].device), labels=torch.zeros((0,), dtype=torch.int, device=features["feat_res4"].device), scores=torch.zeros((0,), device=features["feat_res4"].device), embeddings=torch.zeros((0,256), device=features["feat_res4"].device)
+                    )
+                )
+            else:
+                # Postprocess boxes for inference
+                time_start = time.time()
+                boxes, scores, embeddings, labels = self.postprocess_boxes(
+                    box_cls_scores,
+                    box_regs,
+                    box_embeddings,
+                    combined_boxes,
+                    image_shapes,
+                    fcs=scores_air if scores_air is not None else scores_ground,
+                    gt_det=None,
+                    cws=True,
+                )
+                timing_info["postprocess_boxes_time"] = (time.time() - time_start) * 1000
+                num_images = len(boxes)
+                for i in range(num_images):
+                    result.append(
+                        dict(
+                            boxes=boxes[i], labels=labels[i], scores=scores[i], embeddings=embeddings[i]
+                        )
+                    )
+        return result, losses, timing_info
+    
+    def get_boxes(self, box_regression, proposals, image_shapes):
+        """
+        Get boxes from proposals.
+        """
+        boxes_per_image = [len(boxes_in_image) for boxes_in_image in proposals]
+        pred_boxes = self.box_coder.decode(box_regression, proposals)
+        pred_boxes = pred_boxes.split(boxes_per_image, 0)
+
+        all_boxes = []
+        for boxes, image_shape in zip(pred_boxes, image_shapes):
+            boxes = box_ops.clip_boxes_to_image(boxes, image_shape)
+            # remove predictions with the background label
+            boxes = boxes[:, 1:].reshape(-1, 4)
+            all_boxes.append(boxes)
+
+        return all_boxes
+
+    def postprocess_boxes(
+        self,
+        class_logits,
+        box_regression,
+        embeddings,
+        proposals,
+        image_shapes,
+        fcs=None,
+        gt_det=None,
+        cws=True,
+    ):
+        """
+        Similar to RoIHeads.postprocess_detections, but can handle embeddings and implement
+        First Classification Score (FCS).
+        """
+        device = class_logits.device
+
+        boxes_per_image = [len(boxes_in_image) for boxes_in_image in proposals]
+        pred_boxes = self.box_coder.decode(box_regression, proposals)
+
+        if fcs is not None:
+            # Fist Classification Score (FCS)
+            pred_scores = fcs[0]
+        else:
+            pred_scores = torch.sigmoid(class_logits)
+        
+        # 添加调试代码，检查 proposals 和 class_logits 的数量
+        #print(f"proposals shape: {sum(boxes_per_image)}")
+        #print(f"class_logits shape: {class_logits.shape[0]}")
+        #print(f"fcs shape: {fcs[0].shape if fcs is not None else 'None'}")
+
+        if cws:
+            # Confidence Weighted Similarity (CWS)
+            # 添加调试代码，检查 embeddings 和 pred_scores 的尺寸
+            #print(f"embeddings shape: {embeddings.shape}")
+            #print(f"pred_scores shape: {pred_scores.shape}")
+            embeddings = embeddings * pred_scores.view(-1, 1)
+
+        # split boxes and scores per image
+        pred_boxes = pred_boxes.split(boxes_per_image, 0)
+        pred_scores = pred_scores.split(boxes_per_image, 0)
+        pred_embeddings = embeddings.split(boxes_per_image, 0)
+
+        all_boxes = []
+        all_scores = []
+        all_labels = []
+        all_embeddings = []
+        for boxes, scores, embeddings, image_shape in zip(
+            pred_boxes, pred_scores, pred_embeddings, image_shapes
+        ):
+            boxes = box_ops.clip_boxes_to_image(boxes, image_shape)
+
+            # create labels for each prediction
+            labels = torch.ones(scores.size(0), device=device)
+
+            # remove predictions with the background label
+            boxes = boxes[:, 1:]
+            scores = scores.unsqueeze(1)
+            labels = labels.unsqueeze(1)
+
+            # batch everything, by making every class prediction be a separate instance
+            boxes = boxes.reshape(-1, 4)
+            scores = scores.flatten()
+            labels = labels.flatten()
+            embeddings = embeddings.reshape(-1, self.embedding_head.dim)
+
+            # remove low scoring boxes
+            inds = torch.nonzero(scores > self.score_thresh).squeeze(1)
+            boxes, scores, labels, embeddings = (
+                boxes[inds],
+                scores[inds],
+                labels[inds],
+                embeddings[inds],
+            )
+
+            # remove empty boxes
+            keep = box_ops.remove_small_boxes(boxes, min_size=1e-2)
+            boxes, scores, labels, embeddings = (
+                boxes[keep],
+                scores[keep],
+                labels[keep],
+                embeddings[keep],
+            )
+
+            if gt_det is not None:
+                # include GT into the detection results
+                boxes = torch.cat((boxes, gt_det["boxes"]), dim=0)
+                labels = torch.cat((labels, torch.tensor([1.0]).to(device)), dim=0)
+                scores = torch.cat((scores, torch.tensor([1.0]).to(device)), dim=0)
+                embeddings = torch.cat((embeddings, gt_det["embeddings"]), dim=0)
+
+            # non-maximum suppression, independently done per class
+            keep = box_ops.batched_nms(boxes, scores, labels, self.nms_thresh)
+            # keep only topk scoring predictions
+            keep = keep[: self.detections_per_img]
+            boxes, scores, labels, embeddings = (
+                boxes[keep],
+                scores[keep],
+                labels[keep],
+                embeddings[keep],
+            )
+
+            all_boxes.append(boxes)
+            all_scores.append(scores)
+            all_labels.append(labels)
+            all_embeddings.append(embeddings)
+
+        return all_boxes, all_scores, all_embeddings, all_labels
+
+
+class NormAwareEmbedding(nn.Module):
+    """
+    Implements the Norm-Aware Embedding proposed in
+    Chen, Di, et al. "Norm-aware embedding for efficient person search." CVPR 2020.
+    """
+
+    def __init__(self, featmap_names=["feat_res4", "feat_res5"], in_channels=[256, 512], dim=256):
+        super(NormAwareEmbedding, self).__init__()
+        self.featmap_names = featmap_names
+        self.in_channels = in_channels
+        self.dim = dim
+
+        self.projectors = nn.ModuleDict()
+        indv_dims = self._split_embedding_dim()
+        for ftname, in_channel, indv_dim in zip(self.featmap_names, self.in_channels, indv_dims):
+            proj = nn.Sequential(nn.Linear(in_channel, indv_dim), nn.BatchNorm1d(indv_dim))
+            init.normal_(proj[0].weight, std=0.01)
+            init.normal_(proj[1].weight, std=0.01)
+            init.constant_(proj[0].bias, 0)
+            init.constant_(proj[1].bias, 0)
+            self.projectors[ftname] = proj
+
+        self.rescaler = nn.BatchNorm1d(1, affine=True)
+
+    def forward(self, featmaps):
+        """
+        Arguments:
+            featmaps: OrderedDict[Tensor], and in featmap_names you can choose which
+                      featmaps to use
+        Returns:
+            tensor of size (BatchSize, dim), L2 normalized embeddings.
+            tensor of size (BatchSize, ) rescaled norm of embeddings, as class_logits.
+        """
+        assert len(featmaps) == len(self.featmap_names)
+        if len(featmaps) == 1:
+            k, v = featmaps.items()[0]
+            v = self._flatten_fc_input(v)
+            embeddings = self.projectors[k](v)
+            norms = embeddings.norm(2, 1, keepdim=True)
+            embeddings = embeddings / norms.expand_as(embeddings).clamp(min=1e-12)
+            norms = self.rescaler(norms).squeeze()
+            return embeddings, norms
+        else:
+            outputs = []
+            for k, v in featmaps.items():
+                v = self._flatten_fc_input(v)
+                outputs.append(self.projectors[k](v))
+            embeddings = torch.cat(outputs, dim=1)
+            norms = embeddings.norm(2, 1, keepdim=True)
+            embeddings = embeddings / norms.expand_as(embeddings).clamp(min=1e-12)
+            norms = self.rescaler(norms).squeeze()
+            return embeddings, norms
+
+    def _flatten_fc_input(self, x):
+        if x.ndimension() == 4:
+            assert list(x.shape[2:]) == [1, 1]
+            return x.flatten(start_dim=1)
+        return x
+
+    def _split_embedding_dim(self):
+        parts = len(self.in_channels)
+        tmp = [self.dim // parts] * parts
+        if sum(tmp) == self.dim:
+            return tmp
+        else:
+            res = self.dim % parts
+            for i in range(1, res + 1):
+                tmp[-i] += 1
+            assert sum(tmp) == self.dim
+            return tmp
+                                                         
+
+class BBoxRegressor(nn.Module):
+    """
+    Bounding box regression layer.
+    """
+
+    def __init__(self, in_channels, num_classes=2, bn_neck=True):
+        """
+        Args:
+            in_channels (int): Input channels.
+            num_classes (int, optional): Defaults to 2 (background and pedestrian).
+            bn_neck (bool, optional): Whether to use BN after Linear. Defaults to True.
+        """
+        super(BBoxRegressor, self).__init__()
+        if bn_neck:
+            self.bbox_pred = nn.Sequential(
+                nn.Linear(in_channels, 4 * num_classes), nn.BatchNorm1d(4 * num_classes)
+            )
+            init.normal_(self.bbox_pred[0].weight, std=0.01)
+            init.normal_(self.bbox_pred[1].weight, std=0.01)
+            init.constant_(self.bbox_pred[0].bias, 0)
+            init.constant_(self.bbox_pred[1].bias, 0)
+        else:
+            self.bbox_pred = nn.Linear(in_channels, 4 * num_classes)
+            init.normal_(self.bbox_pred.weight, std=0.01)
+            init.constant_(self.bbox_pred.bias, 0)
+
+    def forward(self, x):
+        if x.ndimension() == 4:
+            if list(x.shape[2:]) != [1, 1]:
+                x = F.adaptive_avg_pool2d(x, output_size=1)
+        x = x.flatten(start_dim=1)
+        bbox_deltas = self.bbox_pred(x)
+        return bbox_deltas
+
+'''
+def detection_losses(
+    proposal_cls_scores,
+    proposal_regs,
+    proposal_labels,
+    proposal_reg_targets,
+    box_cls_scores,
+    box_regs,
+    box_labels,
+    box_reg_targets,
+):
+    proposal_labels = torch.cat(proposal_labels, dim=0)
+    box_labels = torch.cat(box_labels, dim=0)
+    proposal_reg_targets = torch.cat(proposal_reg_targets, dim=0)
+    box_reg_targets = torch.cat(box_reg_targets, dim=0)
+
+    loss_proposal_cls = F.cross_entropy(proposal_cls_scores, proposal_labels)
+    loss_box_cls = F.binary_cross_entropy_with_logits(box_cls_scores, box_labels.float())
+
+    # get indices that correspond to the regression targets for the
+    # corresponding ground truth labels, to be used with advanced indexing
+    sampled_pos_inds_subset = torch.nonzero(proposal_labels > 0).squeeze(1)
+    labels_pos = proposal_labels[sampled_pos_inds_subset]
+    N = proposal_cls_scores.size(0)
+    proposal_regs = proposal_regs.reshape(N, -1, 4)
+
+    loss_proposal_reg = F.smooth_l1_loss(
+        proposal_regs[sampled_pos_inds_subset, labels_pos],
+        proposal_reg_targets[sampled_pos_inds_subset],
+        reduction="sum",
+    )
+    loss_proposal_reg = loss_proposal_reg / proposal_labels.numel()
+
+    sampled_pos_inds_subset = torch.nonzero(box_labels > 0).squeeze(1)
+    labels_pos = box_labels[sampled_pos_inds_subset]
+    N = box_cls_scores.size(0)
+    box_regs = box_regs.reshape(N, -1, 4)
+
+    loss_box_reg = F.smooth_l1_loss(
+        box_regs[sampled_pos_inds_subset, labels_pos],
+        box_reg_targets[sampled_pos_inds_subset],
+        reduction="sum",
+    )
+    loss_box_reg = loss_box_reg / box_labels.numel()
+
+    return dict(
+        loss_proposal_cls=loss_proposal_cls,
+        loss_proposal_reg=loss_proposal_reg,
+        loss_box_cls=loss_box_cls,
+        loss_box_reg=loss_box_reg,
+    )
+'''
+
+#只进行faster-rcnn检测部分的loss计算
+def detection_losses_1(
+    proposal_cls_scores,
+    proposal_regs,
+    proposal_labels,
+    proposal_reg_targets,
+):
+    proposal_labels = torch.cat(proposal_labels, dim=0)
+    proposal_reg_targets = torch.cat(proposal_reg_targets, dim=0)
+
+    loss_proposal_cls = F.cross_entropy(proposal_cls_scores, proposal_labels)
+
+    # get indices that correspond to the regression targets for the
+    # corresponding ground truth labels, to be used with advanced indexing
+    sampled_pos_inds_subset = torch.nonzero(proposal_labels > 0).squeeze(1)
+    labels_pos = proposal_labels[sampled_pos_inds_subset]
+    N = proposal_cls_scores.size(0)
+    proposal_regs = proposal_regs.reshape(N, -1, 4)
+
+    loss_proposal_reg = F.smooth_l1_loss(
+        proposal_regs[sampled_pos_inds_subset, labels_pos],
+        proposal_reg_targets[sampled_pos_inds_subset],
+        reduction="sum",
+    )
+    loss_proposal_reg = loss_proposal_reg / proposal_labels.numel()
+
+
+    return dict(
+        loss_proposal_cls=loss_proposal_cls,   #RPN网络的分类损失
+        loss_proposal_reg=loss_proposal_reg,   #RPN网络的回归损失
+    )
+
+#只进行RoIHeads检测部分的loss计算
+def detection_losses_2(
+    box_cls_scores,
+    box_regs,
+    box_labels,
+    box_reg_targets,
+):
+    box_labels = torch.cat(box_labels, dim=0)
+    box_reg_targets = torch.cat(box_reg_targets, dim=0)
+
+    loss_box_cls = F.binary_cross_entropy_with_logits(box_cls_scores, box_labels.float())
+
+    # get indices that correspond to the regression targets for the
+    # corresponding ground truth labels, to be used with advanced indexing
+    sampled_pos_inds_subset = torch.nonzero(box_labels > 0).squeeze(1)
+    labels_pos = box_labels[sampled_pos_inds_subset]
+    N = box_cls_scores.size(0)
+    box_regs = box_regs.reshape(N, -1, 4)
+
+    loss_box_reg = F.smooth_l1_loss(
+        box_regs[sampled_pos_inds_subset, labels_pos],
+        box_reg_targets[sampled_pos_inds_subset],
+        reduction="sum",
+    )
+    loss_box_reg = loss_box_reg / box_labels.numel()
+
+    return dict(
+        loss_box_cls=loss_box_cls,             #RoIHeads的分类损失
+        loss_box_reg=loss_box_reg,             #RoIHeads的回归损失
+    )

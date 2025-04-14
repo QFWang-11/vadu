@@ -1,0 +1,14 @@
+OUTPUT_DIR: "/home/patrick/wqf/SeqNet-master/logs/logs_e2e_v21_paired_trainmethod3_roi_align_16_8_frozenbn_batchsize_3_3_3_oimloss_0.5"
+INPUT:
+  DATASET: "CUHK-SYSU"
+  DATA_ROOT: "/home/patrick/wqf/Data/G2APS/G2APS/"
+  MIN_SIZE: [600, 800, 900]
+  #MIN_SIZE: 900
+  MAX_SIZE: 1500
+  BATCH_SIZE_TRAIN: 3
+SOLVER:
+  MAX_EPOCHS: 19
+MODEL:
+  LOSS:
+    LUT_SIZE: 5532       #查找表的大小
+    CQ_SIZE: 5000        #Candidate Queue候选队列的大小
